@@ -10,9 +10,9 @@ debug = False  # Set to False to enable actual servo control
 cam_source = 0  # 0 for default laptop webcam
 
 # Gripper sensitivity settings
-fist_threshold = 5  # Lower value = more sensitive (was 7)
-GRIPPER_OPEN_ANGLE = 180
-GRIPPER_CLOSE_ANGLE = 0
+fist_threshold = 0.35  # Adjusted threshold for better sensitivity
+GRIPPER_OPEN_ANGLE = 20    # Changed: 20 degrees when hand is open (was 0)
+GRIPPER_CLOSE_ANGLE = 160  # Changed: 160 degrees when hand is closed (was 180)
 
 # Serial configuration for Arduino Mega 2560
 BAUD_RATE = 115200   # Make sure this matches Arduino code
@@ -102,16 +102,54 @@ if write_video:
 clamp = lambda n, minn, maxn: max(min(maxn, n), minn)
 # map_range = lambda x, in_min, in_max, out_min, out_max: abs((x - in_min) * (out_max - out_min) // (in_max - in_min) + out_min)
 
+# Calibration settings for grip detection
+CALIBRATION_SAMPLES = 10  # Number of samples to collect for calibration
+calibration_data = {
+    'open': [],
+    'closed': []
+}
+is_calibrating = True
+calibration_step = 0
+
+def calculate_hand_state(hand_landmarks):
+    # Get key points
+    wrist = hand_landmarks.landmark[0]
+    thumb_tip = hand_landmarks.landmark[4]
+    index_tip = hand_landmarks.landmark[8]
+    middle_tip = hand_landmarks.landmark[12]
+    ring_tip = hand_landmarks.landmark[16]
+    pinky_tip = hand_landmarks.landmark[20]
+    
+    # Calculate distances from wrist to finger tips
+    distances = []
+    for tip in [thumb_tip, index_tip, middle_tip, ring_tip, pinky_tip]:
+        dist = np.sqrt((tip.x - wrist.x)**2 + (tip.y - wrist.y)**2 + (tip.z - wrist.z)**2)
+        distances.append(dist)
+    
+    # Calculate average distance
+    avg_distance = np.mean(distances)
+    
+    # Calculate palm size (distance from wrist to middle finger base)
+    middle_base = hand_landmarks.landmark[9]
+    palm_size = np.sqrt((middle_base.x - wrist.x)**2 + (middle_base.y - wrist.y)**2 + (middle_base.z - wrist.z)**2)
+    
+    # Normalize distance by palm size
+    normalized_distance = avg_distance / palm_size
+    
+    return normalized_distance
+
 # Check if the hand is a fist (for gripper control)
 def is_fist(hand_landmarks, palm_size):
-    # calculate the distance between the wrist and the each finger tip
-    distance_sum = 0
-    WRIST = hand_landmarks.landmark[0]
-    for i in [7,8,11,12,15,16,19,20]:
-        distance_sum += ((WRIST.x - hand_landmarks.landmark[i].x)**2 + \
-                         (WRIST.y - hand_landmarks.landmark[i].y)**2 + \
-                         (WRIST.z - hand_landmarks.landmark[i].z)**2)**0.5
-    return distance_sum/palm_size < fist_threshold
+    normalized_distance = calculate_hand_state(hand_landmarks)
+    
+    # Use calibrated values if available
+    if calibration_data['open'] and calibration_data['closed']:
+        open_avg = sum(calibration_data['open']) / len(calibration_data['open'])
+        closed_avg = sum(calibration_data['closed']) / len(calibration_data['closed'])
+        dynamic_threshold = (open_avg + closed_avg) / 2
+        return normalized_distance < dynamic_threshold
+    else:
+        return normalized_distance < fist_threshold
 
 def get_gripper_angle(hand_landmarks):
     # Only calculate gripper angle based on fist detection
@@ -120,64 +158,118 @@ def get_gripper_angle(hand_landmarks):
     # calculate the distance between the wrist and the index finger for palm size
     palm_size = ((WRIST.x - INDEX_FINGER_MCP.x)**2 + (WRIST.y - INDEX_FINGER_MCP.y)**2 + (WRIST.z - INDEX_FINGER_MCP.z)**2)**0.5
 
-    # Return gripper angle based on fist detection
+    # Return gripper angle based on fist detection - REVERSED LOGIC
     if is_fist(hand_landmarks, palm_size):
-        return [GRIPPER_CLOSE_ANGLE]  # Close gripper
+        return [GRIPPER_CLOSE_ANGLE]  # Close gripper (180 degrees) when hand is closed
     else:
-        return [GRIPPER_OPEN_ANGLE]   # Open gripper
+        return [GRIPPER_OPEN_ANGLE]   # Open gripper (0 degrees) when hand is open
 
 # Configure MediaPipe to use GPU
 with mp_hands.Hands(
-    model_complexity=0,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-    max_num_hands=1
+    model_complexity=1,  # Increased model complexity for better accuracy
+    min_detection_confidence=0.7,  # Increased confidence threshold
+    min_tracking_confidence=0.7,   # Increased tracking confidence
+    max_num_hands=1,
+    static_image_mode=False
 ) as hands:
-    while cap.isOpened():
-        success, image = cap.read()
-        if not success:
-            print("Ignoring empty camera frame.")
-            continue
+    try:
+        while cap.isOpened():
+            success, image = cap.read()
+            if not success:
+                print("Ignoring empty camera frame.")
+                continue
 
-        # To improve performance, optionally mark the image as not writeable to
-        # pass by reference.
-        image.flags.writeable = False
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = hands.process(image)
+            # To improve performance, optionally mark the image as not writeable to
+            # pass by reference.
+            image.flags.writeable = False
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            results = hands.process(image)
 
-        # Draw the hand annotations on the image.
-        image.flags.writeable = True
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        if results.multi_hand_landmarks:
-            if len(results.multi_hand_landmarks) == 1:
-                hand_landmarks = results.multi_hand_landmarks[0]
-                servo_angle = get_gripper_angle(hand_landmarks)
-
-                if servo_angle != prev_servo_angle:
-                    print("Gripper angle: ", servo_angle)
-                    prev_servo_angle = servo_angle
-                    if not debug:
-                        ser.write(bytearray(servo_angle))
+            # Draw the hand annotations on the image.
+            image.flags.writeable = True
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            
+            if results.multi_hand_landmarks:
+                if len(results.multi_hand_landmarks) == 1:
+                    hand_landmarks = results.multi_hand_landmarks[0]
+                    
+                    # Calibration mode
+                    if is_calibrating:
+                        normalized_distance = calculate_hand_state(hand_landmarks)
+                        
+                        if calibration_step < CALIBRATION_SAMPLES:
+                            cv2.putText(image, f"Calibration: Open hand ({calibration_step + 1}/{CALIBRATION_SAMPLES})", 
+                                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            calibration_data['open'].append(normalized_distance)
+                        elif calibration_step < CALIBRATION_SAMPLES * 2:
+                            cv2.putText(image, f"Calibration: Closed hand ({calibration_step - CALIBRATION_SAMPLES + 1}/{CALIBRATION_SAMPLES})", 
+                                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                            calibration_data['closed'].append(normalized_distance)
+                        
+                        calibration_step += 1
+                        if calibration_step >= CALIBRATION_SAMPLES * 2:
+                            is_calibrating = False
+                            print("Calibration complete!")
+                            print(f"Open hand average: {sum(calibration_data['open']) / len(calibration_data['open'])}")
+                            print(f"Closed hand average: {sum(calibration_data['closed']) / len(calibration_data['closed'])}")
+                    
+                    # Normal operation mode
+                    else:
+                        servo_angle = get_gripper_angle(hand_landmarks)
+                        if servo_angle != prev_servo_angle:
+                            print("Gripper angle: ", servo_angle)
+                            prev_servo_angle = servo_angle
+                            if not debug:
+                                ser.write(bytearray(servo_angle))
+                else:
+                    print("More than one hand detected")
+                
+                for hand_landmarks in results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(
+                        image,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing_styles.get_default_hand_landmarks_style(),
+                        mp_drawing_styles.get_default_hand_connections_style())
+            
+            # Flip the image horizontally for a selfie-view display.
+            image = cv2.flip(image, 1)
+            
+            # Show gripper angle and calibration status with better positioning
+            if is_calibrating:
+                if calibration_step < CALIBRATION_SAMPLES:
+                    cv2.putText(image, f"Open hand ({calibration_step + 1}/{CALIBRATION_SAMPLES})", 
+                              (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                else:
+                    cv2.putText(image, f"Close hand ({calibration_step - CALIBRATION_SAMPLES + 1}/{CALIBRATION_SAMPLES})", 
+                              (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             else:
-                print("More than one hand detected")
-            for hand_landmarks in results.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(
-                    image,
-                    hand_landmarks,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style(),
-                    mp_drawing_styles.get_default_hand_connections_style())
-        
-        # Flip the image horizontally for a selfie-view display.
-        image = cv2.flip(image, 1)
-        # show gripper angle
-        cv2.putText(image, f"Gripper: {servo_angle[0]}°", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
-        cv2.imshow('Hand Gesture Control - Gripper', image)
+                # Position text in top-right corner for better visibility
+                gripper_state = "OPEN" if servo_angle[0] == GRIPPER_OPEN_ANGLE else "CLOSE"
+                text = f"Gripper: {gripper_state}"
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
+                text_x = image.shape[1] - text_size[0] - 30  # 30 pixels from right edge
+                cv2.putText(image, text, (text_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+            
+            cv2.imshow('Hand Gesture Control - Gripper', image)
 
+            # Check for window close or ESC key
+            key = cv2.waitKey(5) & 0xFF
+            if key == 27 or cv2.getWindowProperty('Hand Gesture Control - Gripper', cv2.WND_PROP_VISIBLE) < 1:
+                print("Window closed or ESC pressed. Cleaning up...")
+                break
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        # Cleanup
+        print("Cleaning up resources...")
         if write_video:
-            out.write(image)
-        if cv2.waitKey(5) & 0xFF == 27:
-            if write_video:
-                out.release()
-            break
-cap.release()
+            out.release()
+        cap.release()
+        cv2.destroyAllWindows()
+        if not debug and 'ser' in locals():
+            # Send final command to open gripper before closing
+            ser.write(bytearray([GRIPPER_OPEN_ANGLE]))
+            ser.close()
+        print("Cleanup complete. Program terminated.")
