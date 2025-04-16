@@ -24,7 +24,7 @@ if gpus:
 # Performance optimization settings
 PROCESS_WIDTH = 640   # Processing width
 PROCESS_HEIGHT = 480  # Processing height
-FRAME_BUFFER_SIZE = 2 # Number of frames to buffer
+FRAME_BUFFER_SIZE = 1 # Reduced buffer size to minimize latency
 
 # config
 write_video = False
@@ -32,26 +32,27 @@ debug = False
 cam_source = 0
 
 # Gripper sensitivity settings
-fist_threshold = 0.6  # Increased threshold for better fist detection
-GRIPPER_OPEN_ANGLE = 170    # Open position (was 10)
-GRIPPER_CLOSE_ANGLE = 10    # Closed position (was 170)
+fist_threshold = 0.8  # Threshold for fist detection
+GRIPPER_OPEN_ANGLE = 170    # Fully open position (0 degrees)
+GRIPPER_CLOSE_ANGLE = 10  # Fully closed position (160 degrees)
 
 # Serial configuration for Arduino Mega 2560
 BAUD_RATE = 115200
 
 class GripperController:
     def __init__(self):
-        self.prev_servo_angle = [GRIPPER_OPEN_ANGLE]
+        # Initialize with closed state (10 degrees)
+        self.prev_servo_angle = [GRIPPER_CLOSE_ANGLE]
         self.debug = False
         self.setup_arduino()
         self.setup_mediapipe()
         
-        # Add state tracking
-        self.is_closed = False
+        # Add state tracking with smaller history
+        self.is_closed = True  # Start in closed state
         self.distance_history = []
-        self.history_size = 5
-        self.close_threshold = 0.98  # Threshold to close
-        self.open_threshold = 1.3   # Higher threshold to open (hysteresis)
+        self.history_size = 3  # Reduced history size
+        self.close_threshold = 0.85  # Adjusted for better fist detection
+        self.open_threshold = 1.2   # Adjusted for better open hand detection
         
     def setup_arduino(self):
         # Find Arduino Mega port
@@ -71,9 +72,12 @@ class GripperController:
             try:
                 self.ser = serial.Serial(arduino_port, BAUD_RATE, timeout=1)
                 print(f"Connected to Arduino Mega 2560 on {arduino_port}")
-                # Reset Arduino
+                # Reset Arduino and set initial position
                 self.ser.dtr = False
                 self.ser.dtr = True
+                # Send initial closed position
+                if not self.debug:
+                    self.ser.write(bytearray([GRIPPER_CLOSE_ANGLE]))
             except serial.SerialException as e:
                 print(f"Error connecting to Arduino: {e}")
                 print("Running in debug mode...")
@@ -95,28 +99,33 @@ class GripperController:
     
     def process_frame(self, frame, hands):
         """Process frame using GPU acceleration"""
-        # Mirror the frame horizontally
-        frame = cv2.flip(frame, 1)
-        
-        # Make frame writable
-        frame.flags.writeable = False
-        
-        # Convert frame to RGB for MediaPipe
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Process with MediaPipe
-        results = hands.process(frame_rgb)
-        
-        # Make frame writable again
-        frame.flags.writeable = True
-        
-        # Convert back to BGR for display
-        frame_display = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        
-        # Resize for display
-        frame_display = cv2.resize(frame_display, (PROCESS_WIDTH, PROCESS_HEIGHT))
-        
-        return results, frame_display
+        try:
+            # Mirror the frame horizontally
+            frame = cv2.flip(frame, 1)
+            
+            # Resize first to reduce processing load
+            frame = cv2.resize(frame, (PROCESS_WIDTH, PROCESS_HEIGHT))
+            
+            # Make frame writable
+            frame.flags.writeable = False
+            
+            # Convert frame to RGB for MediaPipe
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Process with MediaPipe
+            results = hands.process(frame_rgb)
+            
+            # Make frame writable again
+            frame.flags.writeable = True
+            
+            # Convert back to BGR for display
+            frame_display = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            
+            return results, frame_display
+            
+        except Exception as e:
+            print(f"Error in process_frame: {e}")
+            return None, frame
     
     def calculate_hand_state(self, hand_landmarks):
         """Calculate hand state with improved fist detection"""
@@ -166,13 +175,15 @@ class GripperController:
         # Print for debugging
         print(f"Hand openness: {normalized_distance:.2f}, Average: {avg_distance:.2f}, Is Closed: {self.is_closed}")
         
-        # Apply hysteresis
+        # Apply hysteresis with reversed logic:
+        # When hand is closed (small distance) -> GRIPPER_CLOSE_ANGLE (10)
+        # When hand is open (large distance) -> GRIPPER_OPEN_ANGLE (170)
         if not self.is_closed and avg_distance < self.close_threshold:
             self.is_closed = True
-            return [GRIPPER_CLOSE_ANGLE]
+            return [GRIPPER_CLOSE_ANGLE]  # 10 degrees when hand is closed
         elif self.is_closed and avg_distance > self.open_threshold:
             self.is_closed = False
-            return [GRIPPER_OPEN_ANGLE]
+            return [GRIPPER_OPEN_ANGLE]   # 170 degrees when hand is open
         else:
             # Maintain current state
             return [GRIPPER_CLOSE_ANGLE] if self.is_closed else [GRIPPER_OPEN_ANGLE]
@@ -190,10 +201,27 @@ class GripperController:
                 raise Exception("Could not open camera")
             
             print("Camera initialized successfully")
+            print(f"Initial state: CLOSED (Angle: {GRIPPER_CLOSE_ANGLE})")
+            
+            # Send initial position to Arduino
+            if not self.debug and hasattr(self, 'ser'):
+                self.ser.write(bytearray([GRIPPER_CLOSE_ANGLE]))
+
+            frame_count = 0
+            skip_frames = 1  # Process every nth frame
             
             # Initialize MediaPipe Hands with GPU optimization
             with self.mp_hands.Hands(**self.MP_HANDS_CONFIG) as hands:
                 while cap.isOpened():
+                    # Skip frames if needed
+                    frame_count += 1
+                    if frame_count % skip_frames != 0:
+                        continue
+                        
+                    # Clear buffer
+                    for _ in range(FRAME_BUFFER_SIZE):
+                        cap.grab()
+                    
                     success, frame = cap.read()
                     if not success:
                         print("Failed to read camera frame")
@@ -201,6 +229,8 @@ class GripperController:
 
                     # Process frame
                     results, frame = self.process_frame(frame, hands)
+                    if results is None:
+                        continue
                     
                     if results.multi_hand_landmarks:
                         if len(results.multi_hand_landmarks) == 1:
@@ -232,15 +262,16 @@ class GripperController:
                                 self.prev_servo_angle = new_servo_angle
                                 if not self.debug:
                                     self.ser.write(bytearray(new_servo_angle))
-                        else:
-                            print("Multiple hands detected")
                     
                     # Show frame
                     cv2.imshow('Hand Gesture Control - Gripper', frame)
                     
-                    # Check for exit
-                    if cv2.waitKey(5) & 0xFF == 27 or cv2.getWindowProperty('Hand Gesture Control - Gripper', cv2.WND_PROP_VISIBLE) < 1:
+                    # Check for exit with shorter wait time
+                    if cv2.waitKey(1) & 0xFF == 27 or cv2.getWindowProperty('Hand Gesture Control - Gripper', cv2.WND_PROP_VISIBLE) < 1:
                         break
+                    
+                    # Release some memory
+                    del results
                         
         except Exception as e:
             print(f"Error: {e}")
@@ -248,7 +279,7 @@ class GripperController:
             cap.release()
             cv2.destroyAllWindows()
             if not self.debug and hasattr(self, 'ser'):
-                self.ser.write(bytearray([GRIPPER_OPEN_ANGLE]))
+                self.ser.write(bytearray([GRIPPER_CLOSE_ANGLE]))  # Return to closed position
                 self.ser.close()
             print("Cleanup complete. Program terminated.")
 
