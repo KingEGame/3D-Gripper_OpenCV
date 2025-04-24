@@ -2,5 +2,5 @@ pyserial==3.5
 opencv-python==4.7.0.68
 mediapipe==0.10.13
 tensorflow 
-opencv-python 
 numpy
+Pillow==10.0.0  # For GUI image processing
